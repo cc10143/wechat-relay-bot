@@ -1,0 +1,7 @@
+{
+    "check_interval": 3.0,
+    "response_text": "跟一个",
+    "target_groups": ["群聊名称1", "群聊名称2"],
+    "switch_group_interval": 10,
+    "debug_mode": false
+}

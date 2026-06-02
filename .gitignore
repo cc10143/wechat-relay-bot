@@ -1,0 +1,18 @@
+# 配置文件（含群聊名称等个人信息）
+config.json
+
+# 运行时数据
+processed_relays.json
+relay_bot.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code 配置（含个人 settings）
+.claude/
+
+# 系统文件
+Thumbs.db
+.DS_Store
