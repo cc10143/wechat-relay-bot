@@ -5,6 +5,20 @@ config.json
 processed_relays.json
 relay_bot.log
 
+# 调试截图
+*_debug.png
+chat_*.png
+wechat_*.png
+candidate_*.png
+match_*.png
+calibrate_*.png
+button_clean.png
+template_relay.png
+screenshot.png
+
+# 诊断输出
+wechat_ui_dump.txt
+
 # Python 缓存
 __pycache__/
 *.pyc
