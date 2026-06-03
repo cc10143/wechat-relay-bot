@@ -344,6 +344,18 @@ class RelayBot:
         except:
             return False
 
+    def _preload_existing_relays(self):
+        """启动时预加载已有接龙，防止接上运行前就存在的接龙"""
+        count = 0
+        for btn in self.find_relays():
+            fp = self._fingerprint(btn)
+            if fp not in self.processed:
+                self.processed.add(fp)
+                count += 1
+        if count > 0:
+            self._save_processed()
+            logging.info(f"已忽略 {count} 个运行前已存在的接龙")
+
     # ---------- 群聊切换 ----------
 
     def _switch_to_next_group(self):
@@ -419,6 +431,9 @@ class RelayBot:
         if not self.connect():
             input("\n按 Enter 退出...")
             return
+
+        # 预加载：把当前已有的接龙标记为已处理，避免接旧龙
+        self._preload_existing_relays()
 
         logging.info("▶ 开始监控（按 Ctrl+C 停止）\n")
 
