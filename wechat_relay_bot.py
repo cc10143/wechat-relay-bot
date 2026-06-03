@@ -1,21 +1,18 @@
 """
-微信自动接龙脚本 v2.0
+微信自动接龙脚本 v3.0
 ========================
 功能：监控微信群聊中的接龙消息，自动点击"参与接龙"并填写内容
-原理：pyautogui + OpenCV 模板匹配（适配微信 4.0+）
+原理：uiautomation 控件操作（适配微信 3.x）
 
 使用方法：
-  1. pip install pyautogui opencv-python-headless uiautomation pillow
+  1. pip install uiautomation
   2. 修改 config.json
-  3. 保持微信已登录，窗口打开，目标群聊可见
+  3. 保持微信已登录，窗口打开，目标群聊在聊天列表可见
   4. 运行：python wechat_relay_bot.py
 """
 
-import pyautogui
-import cv2
-import numpy as np
-from PIL import Image
 import uiautomation as auto
+import pyautogui
 import json
 import time
 import logging
@@ -23,27 +20,33 @@ import os
 import hashlib
 import sys
 import traceback
-from typing import Optional, Tuple, List, Set
+import subprocess
+import ctypes
+from typing import Optional, Set, List, Tuple
 
 # ===== 路径 =====
 BASE_DIR = os.path.dirname(__file__)
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 PROCESSED_FILE = os.path.join(BASE_DIR, "processed_relays.json")
-TEMPLATE_FILE = os.path.join(BASE_DIR, "relay_template.png")
 LOG_FILE = os.path.join(BASE_DIR, "relay_bot.log")
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.01
 
 # ===== 默认配置 =====
 DEFAULT_CONFIG = {
-    "check_interval": 2.0,
+    "check_interval": 3.0,
     "response_text": "跟一个",
     "target_groups": [],
     "switch_group_interval": 10,
-    "template_threshold": 0.5,
     "debug_mode": False,
 }
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.1
+# WeChat control names (Unicode)
+WECHAT_WIN_NAME = "微信"
+CHAT_LIST_NAME = "会话"
+MSG_LIST_NAME = "消息"
+RELAY_BTN_NAME = "参与接龙"
 
 
 def load_json(path, default=None):
@@ -62,231 +65,357 @@ def save_json(path, data):
 
 
 def setup_logging(debug=False):
-    logging.basicConfig(
-        level=logging.DEBUG if debug else logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%H:%M:%S',
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding='utf-8', mode='a'),
-            logging.StreamHandler()
-        ]
+    """Set up logging - only our module's messages, not uiautomation internals"""
+    level = logging.DEBUG if debug else logging.INFO
+    logger = logging.getLogger()  # Root logger
+    logger.setLevel(level)
+
+    # Remove any existing handlers
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
     )
+
+    fh = logging.FileHandler(LOG_FILE, encoding='utf-8', mode='a')
+    fh.setLevel(level)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    # Suppress uiautomation's verbose COM debug messages
+    class UIAFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            return not ('Release <POINTER' in msg or 'POINTER(IUIAutomation' in msg
+                        or 'GetModule' in msg or 'CoCreateInstance' in msg)
+
+    for h in logger.handlers:
+        if debug:
+            h.addFilter(UIAFilter())
+        else:
+            # In non-debug mode, also filter out DEBUG level entirely
+            if level > logging.DEBUG:
+                pass  # Already filtered by level
 
 
 class RelayBot:
     def __init__(self):
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_FILE, {})}
         self.processed: Set[str] = set(load_json(PROCESSED_FILE, []))
-        self.wechat_rect: Optional[Tuple[int, int, int, int]] = None
         self.window: Optional[auto.WindowControl] = None
-        self.template = self._load_template()
-        self._prev_chat_hash = None
+        self._joining = False
+        self._joining_timeout = 0
         self._last_group_switch = 0
         self._current_group_index = -1
-        self._chat_offset_x = 375  # Chat area X offset within window screenshot
-        self._chat_width = 0
-        self._chat_height = 0
 
     # ---------- 持久化 ----------
 
     def _save_processed(self):
         save_json(PROCESSED_FILE, list(self.processed))
 
-    # ---------- 模板 ----------
+    # ---------- 窗口保活 ----------
 
-    def _load_template(self):
-        """加载"参与接龙"按钮模板"""
-        t = Image.open(TEMPLATE_FILE) if os.path.exists(TEMPLATE_FILE) else None
-        if t:
-            t = t.convert('L')
-            logging.info(f"模板已加载: {t.size}")
-            return np.array(t)
-        logging.warning("模板文件不存在，请先运行 --calibrate")
-        return None
+    def _ensure_window(self):
+        """Refresh window reference if needed"""
+        if not self.window or not self.window.Exists():
+            win = auto.WindowControl(searchDepth=1, Name=WECHAT_WIN_NAME)
+            if win.Exists():
+                self.window = win
+                return True
+            return False
+        return True
 
-    # ---------- 窗口 ----------
+    # ---------- 窗口连接 ----------
+
+    def _restore_wechat_window(self):
+        """Try to restore WeChat window from tray off-screen state using Win32 API."""
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                time.sleep(0.3)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                return True
+        except:
+            pass
+        return False
 
     def connect(self) -> bool:
         logging.info("正在连接微信...")
+        # First try to restore the window if it's hidden
+        self._restore_wechat_window()
+        time.sleep(1)
         for i in range(30):
             try:
-                win = auto.WindowControl(searchDepth=1, Name="微信")
+                win = auto.WindowControl(searchDepth=1, Name=WECHAT_WIN_NAME)
                 if win.Exists():
                     self.window = win
-                    r = win.BoundingRectangle
-                    self.wechat_rect = (r.left, r.top, r.right, r.bottom)
-                    w_width = r.width()
-                    w_height = r.height()
-                    # Chat message area: right portion of the window
-                    # Left toolbar ~68px, chat list ~308px, message area = rest
-                    self._chat_offset_x = 375  # Approximate
-                    self._chat_width = w_width - self._chat_offset_x
-                    self._chat_height = w_height
-                    logging.info(f"✓ 微信已连接 ({w_width}x{w_height})")
-                    logging.info(f"  消息区域: ({r.left + self._chat_offset_x}, {r.top}) - "
-                                 f"({r.right}, {r.bottom})")
+                    win.SetActive()
+                    time.sleep(0.5)
+                    logging.info("已连接微信窗口")
                     return True
             except:
                 pass
             if i == 0:
                 logging.info("等待微信窗口...")
             time.sleep(1)
-        logging.error("✗ 未找到微信窗口")
+        logging.error("未找到微信窗口")
         return False
 
-    # ---------- 截图 ----------
+    # ---------- 控件搜索 ----------
 
-    def _screenshot_chat_area(self) -> Optional[np.ndarray]:
-        """截取聊天消息区域（灰度）"""
-        if not self.wechat_rect:
-            return None
-        left, top, right, bottom = self.wechat_rect
-        try:
-            s = pyautogui.screenshot(region=(
-                left + self._chat_offset_x, top,
-                self._chat_width, self._chat_height
-            ))
-            return cv2.cvtColor(np.array(s), cv2.COLOR_RGB2GRAY)
-        except Exception as e:
-            logging.debug(f"截图失败: {e}")
-            return None
+    def _get_cols(self):
+        """Get the 3-column layout of the WeChat window"""
+        main = self.window.GetFirstChildControl()
+        inner = main.GetFirstChildControl()
+        return inner.GetChildren()
 
-    def _chat_bottom_region(self, img: np.ndarray) -> np.ndarray:
-        """取聊天区域底部 40%（接龙按钮出现的位置）"""
-        h = img.shape[0]
-        return img[int(h * 0.6):, :]
-
-    # ---------- 变化检测 ----------
-
-    def _has_new_content(self, img: np.ndarray) -> bool:
-        """通过像素哈希快速判断聊天区域是否有新内容"""
-        h = img.shape[0]
-        bottom_part = img[int(h * 0.5):, :]
-        # Downsample and hash
-        small = cv2.resize(bottom_part, (32, 32))
-        hval = hashlib.md5(small.tobytes()).hexdigest()[:16]
-
-        if self._prev_chat_hash is None:
-            self._prev_chat_hash = hval
-            return False
-
-        changed = hval != self._prev_chat_hash
-        self._prev_chat_hash = hval
-        return changed
-
-    # ---------- 接龙检测 ----------
-
-    def find_relay_button(self) -> Optional[Tuple[int, int]]:
-        """用模板匹配找"参与接龙"按钮，返回屏幕绝对坐标"""
-        if self.template is None:
-            return None
-
-        chat_img = self._screenshot_chat_area()
-        if chat_img is None:
-            return None
-
-        th, tw = self.template.shape
-
-        # 先快速检查底部区域是否有变化
-        if self._prev_chat_hash is not None and not self._has_new_content(chat_img):
-            return None
-
-        # 多尺度模板匹配
-        best_score = 0
-        best_pos = None
-
-        for scale in [1.0, 0.85, 0.7]:
-            if scale != 1.0:
-                scaled_tpl = cv2.resize(self.template, None, fx=scale, fy=scale,
-                                        interpolation=cv2.INTER_AREA)
-            else:
-                scaled_tpl = self.template
-
-            sth, stw = scaled_tpl.shape
-            if sth > chat_img.shape[0] or stw > chat_img.shape[1]:
-                continue
-
-            try:
-                res = cv2.matchTemplate(chat_img, scaled_tpl, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            except:
-                continue
-
-            if max_val > best_score:
-                best_score = max_val
-                # Convert to absolute screen coordinates
-                btn_center_x = (self.wechat_rect[0] + self._chat_offset_x
-                                + max_loc[0] + stw // 2)
-                btn_center_y = self.wechat_rect[1] + max_loc[1] + sth // 2
-                best_pos = (btn_center_x, btn_center_y, max_val)
-
-        if best_score >= self.config["template_threshold"]:
-            logging.info(f"📋 发现接龙按钮 (confidence={best_score:.2f})")
-            return best_pos
-
+    def _find_list_in_panes(self, root, target_name, max_depth=8):
+        """BFS through PaneControls only, looking for a named ListControl.
+        This is fast because it skips non-container controls."""
+        candidates = [root]
+        for _ in range(max_depth):
+            next_level = []
+            for ctrl in candidates:
+                try:
+                    for child in ctrl.GetChildren():
+                        if child.ControlTypeName == "ListControl":
+                            if child.Name == target_name:
+                                return child
+                        elif child.ControlTypeName == "PaneControl":
+                            next_level.append(child)
+                except:
+                    pass
+            candidates = next_level
+            if not candidates:
+                break
         return None
 
-    # ---------- 参与接龙 ----------
+    def _find_list_recursive(self, root, target_name, max_depth=10):
+        """Recursive search through ALL controls for a named ListControl."""
+        def dfs(ctrl, depth=0):
+            if depth > max_depth:
+                return None
+            try:
+                for child in ctrl.GetChildren():
+                    if child.ControlTypeName == "ListControl" and child.Name == target_name:
+                        return child
+                    result = dfs(child, depth + 1)
+                    if result:
+                        return result
+            except:
+                pass
+            return None
+        return dfs(root)
 
-    def join_relay(self, position: Tuple[int, int, int]) -> bool:
-        """点击按钮并填写接龙内容"""
-        x, y, confidence = position
-
-        # 生成唯一指纹（用位置）
-        fp = hashlib.md5(f"{x // 20},{y // 20}".encode()).hexdigest()[:16]
-        if fp in self.processed:
-            return False
-
-        logging.info(f"🔄 正在参与接龙 ({x}, {y})")
-
+    def _get_chat_list(self):
+        """Get the chat session ListControl from the middle column (always visible)"""
         try:
-            # 1. 点击按钮
-            pyautogui.click(x, y)
-            time.sleep(1.5)
+            cols = self._get_cols()
+            if len(cols) < 2:
+                return None
+            result = self._find_list_in_panes(cols[1], CHAT_LIST_NAME, 6)
+            # If not found in middle column, try on the whole window
+            if not result:
+                result = self._find_list_in_panes(self.window, CHAT_LIST_NAME, 10)
+            return result
+        except:
+            return None
 
-            # 2. 等待对话框出现，输入内容
-            pyautogui.typewrite(self.config["response_text"], interval=0.05)
-            time.sleep(0.5)
-            pyautogui.press('enter')
-            time.sleep(0.5)
+    def _debug_list_chats(self):
+        """Debug: dump all chat list items to understand structure."""
+        try:
+            cols = self._get_cols()
+            if len(cols) >= 2:
+                panes = []
+                def collect(ctrl, depth=0):
+                    if depth > 8:
+                        return
+                    try:
+                        for child in ctrl.GetChildren():
+                            if child.ControlTypeName in ("PaneControl", "ListControl"):
+                                panes.append((depth, child.ControlTypeName, child.Name))
+                                collect(child, depth + 1)
+                    except:
+                        pass
+                collect(cols[1])
+                for d, t, n in panes:
+                    logging.debug(f"  [{d}] {t}: '{n}'")
+        except:
+            pass
 
-            self.processed.add(fp)
-            self._save_processed()
-            logging.info(f"✓ 成功参与接龙！")
-            return True
+    def _get_msg_list(self):
+        """Get the message area ListControl - try right column, then full-window recursive search"""
+        try:
+            cols = self._get_cols()
+            if len(cols) >= 3:
+                result = self._find_list_in_panes(cols[2], MSG_LIST_NAME, 8)
+                if result:
+                    return result
+        except:
+            pass
+        # Fallback: recursive search through ALL control types (handles layout edge cases)
+        return self._find_list_recursive(self.window, MSG_LIST_NAME, 12)
 
-        except Exception as e:
-            logging.error(f"✗ 参与接龙失败: {e}")
-            return False
+    # ===== 剪贴板辅助 =====
+
+    @staticmethod
+    def _set_clipboard(text: str):
+        """Set Windows clipboard to Unicode text using Win32 API directly (no pyperclip needed)."""
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 2
+        # Fix ctypes types for 64-bit handle compatibility (handle may exceed 2^31)
+        ctypes.windll.kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        ctypes.windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        ctypes.windll.kernel32.GlobalLock.restype = ctypes.c_void_p
+        ctypes.windll.kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        ctypes.windll.kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        ctypes.windll.user32.SetClipboardData.restype = ctypes.c_void_p
+        ctypes.windll.user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        bytes_data = (text + '\0').encode('utf-16-le')
+        handle = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(bytes_data))
+        ptr = ctypes.windll.kernel32.GlobalLock(handle)
+        ctypes.memmove(ptr, bytes_data, len(bytes_data))
+        ctypes.windll.kernel32.GlobalUnlock(handle)
+        ctypes.windll.user32.OpenClipboard(None)
+        ctypes.windll.user32.EmptyClipboard()
+        ctypes.windll.user32.SetClipboardData(CF_UNICODETEXT, handle)
+        ctypes.windll.user32.CloseClipboard()
 
     # ---------- 群聊切换 ----------
 
-    def _navigate_to_group(self, name: str) -> bool:
-        """用 Ctrl+F 搜索群聊并进入"""
-        try:
-            # 1. 确保微信窗口激活
-            if self.window:
+    def _switch_to_group(self, name: str) -> bool:
+        """Switch to a group by clicking it in the chat list"""
+        logging.debug(f"_switch_to_group({name})")
+        self._ensure_window()
+        chat_list = self._get_chat_list()
+        if not chat_list or not chat_list.Exists():
+            logging.warning(f"聊天列表未找到，尝试 Ctrl+F 搜索")
+            return self._switch_by_search(name)
+
+        found = None
+        items = chat_list.GetChildren()
+        # Try multiple times in case list hasn't finished loading
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(1)
+                # Try scrolling the list
                 try:
-                    self.window.SetActive()
+                    scroll = chat_list.GetScrollPattern()
+                    if scroll:
+                        scroll.SetScrollPercent(0, 0)  # Scroll to top first
+                        time.sleep(0.3)
+                        scroll.SetScrollPercent(0, 100)  # Then bottom (triggers load)
+                        time.sleep(0.5)
                 except:
                     pass
-            time.sleep(0.3)
+                items = chat_list.GetChildren()
 
-            # 2. Ctrl+F 打开搜索
-            pyautogui.hotkey('ctrl', 'f')
-            time.sleep(0.5)
+            # Match: check both ListItemControl.Name and inner ButtonControl.Name
+            for i, item in enumerate(items):
+                try:
+                    if item.ControlTypeName != "ListItemControl":
+                        continue
+                    # Check item's own Name first
+                    if item.Name and name in item.Name:
+                        found = item
+                        logging.debug(f"Found match at index {i} (item.Name)")
+                        break
+                    # Then check inner button Name
+                    btn = item.ButtonControl()
+                    if btn.Exists():
+                        btn_name = btn.Name
+                        if btn_name and name in btn_name:
+                            found = item
+                            logging.debug(f"Found match at index {i} (btn.Name)")
+                            break
+                except:
+                    continue
+            if found:
+                break
+            logging.debug(f"第 {attempt + 1} 次扫描未找到「{name}」（共 {len(items)} 项）")
 
-            # 3. 输入群名
-            pyautogui.typewrite(name, interval=0.03)
-            time.sleep(0.8)
+        if not found:
+            logging.warning(f"群聊「{name}」未在聊天列表中找到，尝试 Ctrl+F")
+            if self.config.get("debug_mode", False):
+                self._debug_list_chats()
+            return self._switch_by_search(name)
 
-            # 4. Enter 进入第一个结果
-            pyautogui.press('enter')
-            time.sleep(1.5)
+        try:
+            self.window.SetActive()
+            time.sleep(0.2)
+
+            # Check if the item has a valid bounding rect (visible on screen)
+            rect = found.BoundingRectangle
+            try:
+                if hasattr(rect, 'width'):
+                    visible = rect.width > 0 and rect.height > 0
+                else:
+                    visible = rect[2] > rect[0] and rect[3] > rect[1]
+            except:
+                visible = False
+
+            if not visible:
+                logging.debug("列表项不可见，尝试 SetFocus + 重试...")
+                try:
+                    found.SetFocus()
+                    time.sleep(0.5)
+                except:
+                    pass
+
+            # Final visibility check
+            try:
+                rect = found.BoundingRectangle
+                if hasattr(rect, 'width'):
+                    visible = rect.width > 0 and rect.height > 0
+                else:
+                    visible = rect[2] > rect[0] and rect[3] > rect[1]
+            except:
+                visible = True  # If we can't check, proceed anyway
+
+            if not visible:
+                logging.warning("群聊项不可见，尝试 Ctrl+F 搜索切换")
+                return self._switch_by_search(name)
+
+            found.Click()
+            # 轮询等待消息列表可用（最多约 5s）
+            for _ in range(10):
+                if self._get_msg_list():
+                    break
+                time.sleep(0.5)
+            logging.info(f"已切换到群聊「{name}」")
             return True
-
         except Exception as e:
-            logging.error(f"切换到群聊「{name}」失败: {e}")
+            logging.error(f"点击群聊「{name}」失败: {e}")
+            return False
+
+    def _switch_by_search(self, name: str) -> bool:
+        """Fallback: use Ctrl+F, paste from clipboard, then Enter"""
+        try:
+            # Ensure window is focused
+            self.window.SetActive()
+            time.sleep(0.3)
+            self.window.SetFocus()
+            time.sleep(0.2)
+            auto.SendKeys('{Ctrl}f')
+            time.sleep(0.8)
+            self._set_clipboard(name)
+            time.sleep(0.2)
+            auto.SendKeys('{Ctrl}v')
+            time.sleep(0.5)
+            auto.SendKeys('{Enter}')
+            time.sleep(1.5)
+            logging.info(f"通过搜索切换到「{name}」")
+            return True
+        except Exception as e:
+            logging.error(f"搜索群聊「{name}」失败: {e}")
             return False
 
     def _switch_to_next_group(self):
@@ -299,57 +428,324 @@ class RelayBot:
         logging.info(f"切换到群聊: {name}")
 
         for attempt in range(2):
-            if self._navigate_to_group(name):
-                # 切换后重置变化检测，避免把旧内容当作新消息
-                self._prev_chat_hash = None
-                # 立即扫一次，把已有的接龙标记掉
-                time.sleep(1)
-                pos = self.find_relay_button()
-                if pos:
-                    self.join_relay(pos)
+            if self._switch_to_group(name):
+                # After switching, wait and scan once to catch any existing relay
+                time.sleep(0.5)
                 return
-            time.sleep(2)
+            logging.warning(f"第 {attempt + 1} 次切换失败，重试...")
+            time.sleep(3)
 
         logging.error(f"群聊「{name}」切换失败，跳过")
 
-    # ---------- 校准 ----------
+    # ---------- 滚动 ----------
 
-    def calibrate(self):
-        """校准模式：截取微信窗口，保存模板"""
-        logging.info("=" * 48)
-        logging.info("  校准模式")
-        logging.info("=" * 48)
+    def _scroll_msg_list(self):
+        """Try to scroll the message list to reveal latest messages"""
+        msg_list = self._get_msg_list()
+        if msg_list:
+            try:
+                scroll = msg_list.GetScrollPattern()
+                if scroll:
+                    scroll.SetScrollPercent(100, 100)  # Scroll to bottom
+                    time.sleep(0.05)
+                    return
+            except:
+                pass
+        # Fallback: keyboard
+        try:
+            auto.SendKeys('{End}')
+            time.sleep(0.3)
+        except:
+            pass
 
-        if not self.connect():
-            return
+    # ---------- 接龙检测 ----------
 
-        print("\n请在微信中打开一个包含接龙消息的群聊")
-        print("确保「参与接龙」按钮在聊天区域可见")
-        input("准备好后按 Enter 键截图...")
+    @staticmethod
+    def _relay_key_text(relay_text: str) -> str:
+        """Extract first 3 lines of relay for dedup hashing."""
+        lines = relay_text.split('\n')
+        return '\n'.join(lines[:3])
 
-        chat = self._screenshot_chat_area()
-        if chat is None:
-            print("截图失败")
-            return
+    def _relay_hash(self, relay_text: str) -> str:
+        return hashlib.sha256(self._relay_key_text(relay_text).encode('utf-8')).hexdigest()[:16]
 
-        # 保存截图供手动标注
-        cv2.imwrite(os.path.join(BASE_DIR, "calibrate_chat.png"), chat)
-        print(f"\n聊天区域截图已保存: calibrate_chat.png ({chat.shape[1]}x{chat.shape[0]})")
-        print("请告诉我截图里「参与接龙」按钮的 X, Y 坐标")
-        print("你可以用画图工具打开该文件查看坐标")
+    def _is_new_relay(self, relay_text: str) -> bool:
+        return self._relay_hash(relay_text) not in self.processed
+
+    def _mark_relay_done(self, relay_text: str):
+        self.processed.add(self._relay_hash(relay_text))
+        self._save_processed()
+
+    def _is_relay_item(self, item) -> bool:
+        """Check if a ListItemControl represents a relay message."""
+        try:
+            name = item.Name
+            return bool(name and ('接龙' in name or name.startswith('#')))
+        except:
+            return False
+
+    def _find_button_in_pane(self, root) -> Optional[any]:
+        """Find the relay join button within a container.
+        The button has InvokePattern available and typically has an empty Name."""
+        def find_relay_btn(ctrl, depth=0):
+            if depth > 10:
+                return None
+            try:
+                for child in ctrl.GetChildren():
+                    ct = child.ControlTypeName or ''
+                    cn = child.Name or ''
+                    if ct == 'ButtonControl':
+                        # Check InvokePattern
+                        try:
+                            ip = child.GetInvokePattern()
+                            if ip:
+                                if not cn:  # Empty name = relay button
+                                    return child
+                                # Named button (avatar) - keep searching deeper
+                        except:
+                            pass
+                    result = find_relay_btn(child, depth + 1)
+                    if result:
+                        return result
+            except:
+                pass
+            return None
+        return find_relay_btn(root)
+
+    def _find_relay_button_global(self) -> Optional[any]:
+        """Search for relay button in the entire WeChat window."""
+        return self._find_button_in_pane(self.window)
+
+    @staticmethod
+    def _win32_click(x: int, y: int):
+        """Instant click via Win32 API (no cursor animation, no delay)."""
+        ctypes.windll.user32.SetCursorPos(x, y)
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+
+    def _click_relay_button(self, btn) -> bool:
+        """Click the relay button via Win32 mouse_event (instant)."""
+        # t0 = time.time()
+        self._ensure_window()
+        try:
+            if not self.window.IsActive():
+                self.window.SetActive()
+        except:
+            pass
+        # t_activate = time.time() - t0
+        try:
+            r = btn.BoundingRectangle
+            if hasattr(r, 'left'):
+                cx = (r.left + r.right) // 2
+                cy = (r.top + r.bottom) // 2
+            else:
+                cx = (r[0] + r[2]) // 2
+                cy = (r[1] + r[3]) // 2
+            if cy <= 0:
+                logging.warning(f"  按钮不在可视区域内 (y={cy})")
+                return False
+            self._win32_click(cx, cy)
+            # logging.info(f"  点击方式: Win32.click({cx},{cy}) (激活{t_activate:.3f}s, 总{time.time()-t0:.3f}s)")
+            return True
+        except Exception as e:
+            logging.warning(f"  Win32 点击失败: {e}")
+        # Fallback: pyautogui
+        try:
+            r = btn.BoundingRectangle
+            if hasattr(r, 'left'):
+                cx = (r.left + r.right) // 2
+                cy = (r.top + r.bottom) // 2
+            else:
+                cx = (r[0] + r[2]) // 2
+                cy = (r[1] + r[3]) // 2
+            pyautogui.click(cx, cy)
+            logging.info(f"  点击方式: pyautogui(备份)")
+            return True
+        except:
+            pass
+        return False
+
+    def _scan_relays(self) -> List[Tuple[any, str]]:
+        """Fast scan: detect new relay messages. Returns [(item, text)]."""
+        # t0 = time.time()
+        msg_list = self._get_msg_list()
+        if not msg_list:
+            return []
+
+        items = msg_list.GetChildren()
+        relay_count = 0
+        new_relay = None
+        for item in items:
+            try:
+                if item.ControlTypeName != "ListItemControl":
+                    continue
+                if not self._is_relay_item(item):
+                    continue
+                relay_count += 1
+                item_name = item.Name
+                if self._is_new_relay(item_name):
+                    new_relay = (item, item_name)
+                    break
+            except:
+                continue
+
+        # t_scan = time.time() - t0
+        if relay_count > 0:
+            logging.info(f"[扫描] 共 {len(items)} 项 {relay_count} 接龙"
+                         f"{' — 发现新接龙!' if new_relay else ' — 无新接龙'}")
+
+        return [new_relay] if new_relay else []
+
+    def _find_chat_input(self) -> Optional[any]:
+        """Find the main chat input box."""
+        # Try 3-column layout first (fast path)
+        try:
+            cols = self._get_cols()
+            if len(cols) >= 3:
+                def search_col(ctrl, depth=0):
+                    if depth > 8:
+                        return None
+                    try:
+                        for child in ctrl.GetChildren():
+                            t = child.ControlTypeName or ''
+                            if t in ('EditControl', 'RichEditBox', 'DocumentControl'):
+                                return child
+                            r = search_col(child, depth + 1)
+                            if r:
+                                return r
+                    except:
+                        pass
+                    return None
+                result = search_col(cols[2])
+                if result:
+                    return result
+        except:
+            pass
+        # Fallback: global recursive search for EditControl (skipping the search box named '搜索')
+        def search_global(ctrl, depth=0):
+            if depth > 12:
+                return None
+            try:
+                for child in ctrl.GetChildren():
+                    t = child.ControlTypeName or ''
+                    n = child.Name or ''
+                    if t == 'EditControl' and n != '搜索':
+                        return child
+                    r = search_global(child, depth + 1)
+                    if r:
+                        return r
+            except:
+                pass
+            return None
+        return search_global(self.window)
+
+    # ---------- 参与接龙 ----------
+
+    def _join_relay(self, relay_item: any, relay_text: str) -> bool:
+        """Find the button, click it, paste response text, and send."""
+        if not self._is_new_relay(relay_text):
+            return False
+
+        logging.info(f"正在参与接龙: '{relay_text[:40]}'")
+        t_start = time.time()
+
+        # # Benchmark logging overhead
+        # _t = time.time()
+        # logging.info(f"  日志开销测试")
+        # log_cost = time.time() - _t
+
+        self._joining = True
+        self._joining_timeout = time.time() + 15
+
+        try:
+            # 1. Find the relay button (item first, then full window)
+            t0 = time.time()
+            btn = self._find_button_in_pane(relay_item)
+            if not btn:
+                btn = self._find_relay_button_global()
+            if not btn:
+                logging.warning("找不到参与接龙按钮")
+                try:
+                    for child in relay_item.GetChildren():
+                        ct = child.ControlTypeName or '?'
+                        cn = (child.Name or '')[:40]
+                        logging.warning(f"  item子控件: [{ct}] '{cn}'")
+                except:
+                    pass
+                return False
+
+            # 2. Read button properties
+            # t_prop = time.time()
+            btn_name = btn.Name or '(空)'
+            btn_type = btn.ControlTypeName or '?'
+            try:
+                ip = btn.GetInvokePattern()
+                has_ip = '有Invoke' if ip else '无Invoke'
+            except:
+                has_ip = 'Invoke错误'
+            try:
+                r = btn.BoundingRectangle
+                pos = f'({r.left},{r.top})-({r.right},{r.bottom})'
+            except:
+                pos = '未知位置'
+            # t_prop_cost = time.time() - t_prop
+            # t_find = time.time() - t0
+            logging.info(f"  找到按钮: [{btn_type}] '{btn_name}' {has_ip} {pos}")
+
+            # Click
+            t_click = time.time()
+            if not self._click_relay_button(btn):
+                logging.warning("接龙按钮点击失败，跳过")
+                return False
+            t_click_cost = time.time() - t_click
+
+            # 3. Wait for relay template
+            time.sleep(0.01)
+
+            # 4. Paste and send
+            # t_paste = time.time()
+            self._set_clipboard(self.config["response_text"])
+            pyautogui.hotkey('ctrl', 'v')
+            pyautogui.press('enter')
+            # t_send = time.time() - t_paste
+
+            self._mark_relay_done(relay_text)
+            # total = time.time() - t_start
+            logging.info(f"成功参与接龙！")
+            return True
+
+        except Exception as e:
+            logging.error(f"参与接龙失败: {e}")
+            return False
+        finally:
+            self._joining = False
 
     # ---------- 预加载 ----------
 
     def _preload_existing(self):
-        """启动时扫描已有接龙并标记"""
-        pos = self.find_relay_button()
-        if pos:
-            x, y, conf = pos
-            fp = hashlib.md5(f"{x // 20},{y // 20}".encode()).hexdigest()[:16]
-            if fp not in self.processed:
-                self.processed.add(fp)
-                self._save_processed()
-                logging.info(f"已标记 1 个运行前已存在的接龙")
+        """Mark all existing relay messages as already processed.
+        Uses Name-based check only (fast) - no COM navigation per item."""
+        msg_list = self._get_msg_list()
+        if not msg_list:
+            return
+
+        count = 0
+        for item in msg_list.GetChildren():
+            try:
+                if item.ControlTypeName != "ListItemControl":
+                    continue
+                item_name = item.Name
+                # Relay messages start with #接龙
+                if not item_name or not item_name.startswith("#"):
+                    continue
+                if self._is_new_relay(item_name):
+                    self._mark_relay_done(item_name)
+                    count += 1
+            except:
+                continue
+
+        if count > 0:
+            logging.info(f"已标记 {count} 个已有接龙")
 
     # ---------- 主循环 ----------
 
@@ -357,10 +753,9 @@ class RelayBot:
         cfg = self.config
 
         logging.info("=" * 48)
-        logging.info("  微信自动接龙机器人 v2.0")
+        logging.info("  微信自动接龙机器人 v3.0")
         logging.info(f"  检测间隔: {cfg['check_interval']}秒")
         logging.info(f"  接龙内容: {cfg['response_text']}")
-        logging.info(f"  匹配阈值: {cfg['template_threshold']}")
         if cfg["target_groups"]:
             logging.info(f"  监控群聊: {', '.join(cfg['target_groups'])}")
         else:
@@ -371,36 +766,60 @@ class RelayBot:
             input("\n按 Enter 退出...")
             return
 
-        if self.template is None:
-            logging.error("模板未加载，请先运行 --calibrate")
-            input("\n按 Enter 退出...")
-            return
+        # First group switch to enter target chat
+        if cfg["target_groups"]:
+            self._switch_to_next_group()
+            self._last_group_switch = time.time()
 
-        # 预标记已有接龙
+        # Pre-mark existing relays
+        logging.debug("准备预加载...")
+        time.sleep(1)
         self._preload_existing()
+        logging.debug("预加载完成")
 
-        logging.info("▶ 开始监控（按 Ctrl+C 停止）\n")
+        logging.info("开始监控（按 Ctrl+C 停止）\n")
 
         try:
+            multi_group = len(cfg["target_groups"]) > 1
+            tick = 0
             while True:
-                # 群聊切换
-                if cfg["target_groups"]:
+                # Check window still alive
+                if not self.window.Exists():
+                    logging.warning("微信窗口消失，尝试重新连接...")
+                    if not self.connect():
+                        time.sleep(5)
+                        continue
+
+                # Group switching (only for multi-group mode)
+                if multi_group:
                     now = time.time()
                     if now - self._last_group_switch >= cfg["switch_group_interval"]:
                         self._switch_to_next_group()
                         self._last_group_switch = now
+                        time.sleep(0.5)
 
-                # 检测并参与接龙
-                pos = self.find_relay_button()
-                if pos:
-                    self.join_relay(pos)
+                # Scroll to bottom to see latest messages
+                self._scroll_msg_list()
 
+                # Scan for new relays
+                if not self._joining:
+                    relays = self._scan_relays()
+                    for item, text in relays:
+                        self._join_relay(item, text)
+                else:
+                    # Check joining timeout (safety net)
+                    if time.time() > self._joining_timeout:
+                        self._joining = False
+
+                tick += 1
+                if tick % 20 == 0:
+                    logging.info(f"监控中... (已扫描 {tick} 次)")
                 time.sleep(cfg["check_interval"])
 
         except KeyboardInterrupt:
-            logging.info("⏹ 用户中断")
+            logging.info("用户中断")
         except Exception as e:
-            logging.critical(f"❌ 错误: {traceback.format_exc()}")
+            logging.critical(f"错误: {traceback.format_exc()}")
             input("\n按 Enter 退出...")
 
 
@@ -409,8 +828,4 @@ if __name__ == "__main__":
     cfg = {**DEFAULT_CONFIG, **load_json(CONFIG_FILE, {})}
     setup_logging(cfg.get("debug_mode", False))
     bot = RelayBot()
-
-    if "--calibrate" in sys.argv:
-        bot.calibrate()
-    else:
-        bot.run()
+    bot.run()

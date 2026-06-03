@@ -18,6 +18,9 @@ screenshot.png
 
 # 诊断输出
 wechat_ui_dump.txt
+diag_output.txt
+relay_output.log
+@AutomationLog.txt
 
 # Python 缓存
 __pycache__/
