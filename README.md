@@ -10,3 +10,7 @@ cp config.example.json config.json
 ## 使用
 确认微信打开并登录
 然后双击run.bat运行
+
+
+
+deepseek协助完成
