@@ -356,6 +356,66 @@ class RelayBot:
             self._save_processed()
             logging.info(f"已忽略 {count} 个运行前已存在的接龙")
 
+    # ---------- 诊断 ----------
+
+    def diagnose(self):
+        """诊断模式：打印微信窗口控件树，帮助排查按钮找不到的问题"""
+        logging.info("=" * 48)
+        logging.info("  诊断模式：正在扫描微信控件树")
+        logging.info("=" * 48)
+
+        if not self.connect():
+            logging.error("无法连接微信，诊断终止")
+            return
+
+        print("\n请确保你已打开一个包含接龙的群聊窗口")
+        input("准备好后按 Enter 继续...")
+
+        print("\n--- 微信控件树（深度 5）---")
+        self._dump_tree(self.wechat_window, max_depth=5)
+        print("--- 控件树结束 ---\n")
+
+        print("--- 搜索「参与接龙」---")
+        buttons = self._find_controls_deep(
+            self.wechat_window,
+            lambda c: c.Exists() and c.Name and "接龙" in c.Name,
+            max_depth=8,
+        )
+        if buttons:
+            print(f"找到 {len(buttons)} 个包含「接龙」的控件:")
+            for b in buttons:
+                print(f"  Type={type(b).__name__}  Name='{b.Name}'  "
+                      f"Rect=({b.BoundingRectangle.left},{b.BoundingRectangle.top})")
+        else:
+            print("未找到任何包含「接龙」的控件")
+            print("尝试搜索所有按钮控件...")
+            all_btns = self._find_controls_deep(
+                self.wechat_window,
+                lambda c: isinstance(c, auto.ButtonControl) and c.Exists() and c.Name,
+                max_depth=8,
+            )
+            print(f"共找到 {len(all_btns)} 个有文字的按钮:")
+            for b in all_btns[:30]:
+                print(f"  Name='{b.Name}'")
+
+        print("\n诊断完成，请将以上输出告知开发者。")
+        input("按 Enter 退出...")
+
+    def _dump_tree(self, control, indent=0, max_depth=3, _depth=0):
+        """递归打印控件树"""
+        if _depth > max_depth:
+            return
+        try:
+            name = (control.Name or "")[:60]
+            ctrl_type = type(control).__name__
+            rect = control.BoundingRectangle
+            print(f"{'  ' * indent}{ctrl_type} '{name}' "
+                  f"({rect.left},{rect.top},{rect.right},{rect.bottom})")
+            for child in control.GetChildren():
+                self._dump_tree(child, indent + 1, max_depth, _depth + 1)
+        except Exception:
+            pass
+
     # ---------- 群聊切换 ----------
 
     def _switch_to_next_group(self):
@@ -480,4 +540,8 @@ if __name__ == "__main__":
 
     setup_logging(cfg.get("debug_mode", False))
     bot = RelayBot()
-    bot.run()
+
+    if "--diagnose" in sys.argv:
+        bot.diagnose()
+    else:
+        bot.run()
