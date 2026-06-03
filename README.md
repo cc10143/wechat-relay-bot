@@ -13,5 +13,5 @@ cp config.example.json config.json
 
 
 
-deepseek协助完成
-ps：不适用于微信4.X版本
+ps：deepseek协助完成
+不适用于微信4.X版本
