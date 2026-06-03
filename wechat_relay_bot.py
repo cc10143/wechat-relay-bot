@@ -1,5 +1,5 @@
 """
-微信自动接龙脚本 v1.0
+微信自动接龙脚本 v1.1
 ========================
 功能：监控微信群聊中的接龙消息，自动点击"参与接龙"并填写内容
 特点：每条接龙仅自动参与一次，已处理的接龙会记录到文件，重启也不会重复
@@ -143,6 +143,8 @@ class RelayBot:
                     except Exception:
                         pass
                     logging.info("✓ 已连接到微信")
+                    # 等待聊天列表加载就绪
+                    self._wait_chatlist_ready()
                     return True
             except Exception:
                 pass
@@ -154,6 +156,36 @@ class RelayBot:
 
         logging.error("✗ 未找到微信窗口！请先启动微信并登录。")
         return False
+
+    def _wait_chatlist_ready(self, timeout: float = 15.0):
+        """等待聊天列表加载完成（重登后 UI 重建需要时间）"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                items = self._find_controls_deep(
+                    self.wechat_window,
+                    lambda c: (
+                        isinstance(c, auto.ListItemControl)
+                        and c.Exists()
+                        and c.Name
+                        and len(c.Name.strip()) > 0
+                    ),
+                    max_depth=6,
+                )
+                if len(items) >= 1:
+                    logging.debug(f"聊天列表已就绪（{len(items)} 个条目）")
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        logging.warning("聊天列表加载超时（可能窗口未完全就绪）")
+
+    def _is_window_alive(self) -> bool:
+        """检查微信窗口是否还活着"""
+        try:
+            return self.wechat_window is not None and self.wechat_window.Exists()
+        except Exception:
+            return False
 
     # ---------- 查找接龙按钮 ----------
 
@@ -315,33 +347,57 @@ class RelayBot:
     # ---------- 群聊切换 ----------
 
     def _switch_to_next_group(self):
-        """切换到下一个目标群聊"""
+        """切换到下一个目标群聊，带重试"""
         groups = self.config.get("target_groups", [])
-        if not groups or not self.wechat_window:
+        if not groups or not self.wechat_window or not self._is_window_alive():
             return
 
         self._current_group_index = (self._current_group_index + 1) % len(groups)
         group_name = groups[self._current_group_index]
         logging.info(f"切换到群聊: {group_name}")
 
-        try:
-            # 在聊天列表中查找并点击
-            chat_list = self.wechat_window.ListControl(searchDepth=3)
-            if not chat_list.Exists():
-                chat_list = self.wechat_window.PaneControl(searchDepth=3)
+        for attempt in range(2):
+            try:
+                # 在整个微信窗口中深度搜索匹配群聊名称的可点击控件
+                items = self._find_controls_deep(
+                    self.wechat_window,
+                    lambda c: (
+                        c.Exists()
+                        and c.Name
+                        and group_name == c.Name.strip()
+                        and isinstance(c, (auto.ListItemControl, auto.PaneControl, auto.ButtonControl))
+                    ),
+                    max_depth=8,
+                )
 
-            items = self._find_controls_deep(
-                chat_list,
-                lambda c: group_name in (c.Name or ""),
-                max_depth=4,
-            )
-            if items:
-                items[0].Click()
-                time.sleep(2)  # 等待聊天加载
-            else:
-                logging.warning(f"未找到群聊: {group_name}")
-        except Exception as e:
-            logging.error(f"切换群聊失败: {e}")
+                if items:
+                    items[0].Click()
+                    time.sleep(2)
+                    return
+
+                # 第一轮失败：打印当前聊天列表条目辅助排查
+                if attempt == 0:
+                    all_items = self._find_controls_deep(
+                        self.wechat_window,
+                        lambda c: (
+                            isinstance(c, auto.ListItemControl)
+                            and c.Exists()
+                            and c.Name
+                        ),
+                        max_depth=6,
+                    )
+                    names = [c.Name for c in all_items[:20]]
+                    logging.warning(
+                        f"未找到群聊「{group_name}」，当前可见条目 ({len(all_items)}): "
+                        f"{'、'.join(names) if names else '空'}"
+                    )
+                    logging.info(f"3 秒后重试...")
+                    time.sleep(3)
+                else:
+                    logging.error(f"群聊「{group_name}」始终未找到，跳过")
+            except Exception as e:
+                logging.error(f"切换群聊「{group_name}」失败: {e}")
+                time.sleep(1)
 
     # ---------- 主循环 ----------
 
@@ -368,6 +424,15 @@ class RelayBot:
 
         try:
             while True:
+                # 保活检查：窗口退出/崩溃时尝试重连
+                if not self._is_window_alive():
+                    logging.warning("微信窗口已断开，尝试重连...")
+                    self.wechat_window = None
+                    if not self.connect():
+                        logging.error("重连失败，等待 10 秒后重试")
+                        time.sleep(10)
+                        continue
+
                 # 群聊切换
                 if self.config["target_groups"]:
                     now = time.time()
