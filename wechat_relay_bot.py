@@ -291,67 +291,60 @@ class RelayBot:
 
     # ---------- 群聊切换 ----------
 
+    @staticmethod
+    def _bring_window_to_front():
+        """Bring WeChat window to front using Win32 API (fast, no COM timeout)."""
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                return True
+        except:
+            pass
+        return False
+
     def _switch_to_group(self, name: str) -> bool:
-        """Switch to a group by clicking it in the chat list"""
+        """Switch to a group in the chat list"""
+        t0 = time.time()
         logging.debug(f"_switch_to_group({name})")
         self._ensure_window()
-        chat_list = self._get_chat_list()
-        if not chat_list or not chat_list.Exists():
-            logging.warning(f"聊天列表未找到，尝试 Ctrl+F 搜索")
-            return self._switch_by_search(name)
 
+        # Bring window to front
+        if not self._bring_window_to_front():
+            self.window.SetActive()
+        logging.info(f"  计时: 激活窗口={time.time()-t0:.2f}s")
+        time.sleep(1.0)
+
+        # Get chat list and search its visible items
         found = None
-        items = chat_list.GetChildren()
-        # Try multiple times in case list hasn't finished loading
-        for attempt in range(3):
-            if attempt > 0:
-                time.sleep(1)
-                # Try scrolling the list
-                try:
-                    scroll = chat_list.GetScrollPattern()
-                    if scroll:
-                        scroll.SetScrollPercent(0, 0)  # Scroll to top first
-                        time.sleep(0.3)
-                        scroll.SetScrollPercent(0, 100)  # Then bottom (triggers load)
-                        time.sleep(0.5)
-                except:
-                    pass
-                items = chat_list.GetChildren()
-
-            # Match: check both ListItemControl.Name and inner ButtonControl.Name
-            for i, item in enumerate(items):
-                try:
-                    if item.ControlTypeName != "ListItemControl":
+        try:
+            chat_list = self._get_chat_list()
+            if chat_list:
+                for child in chat_list.GetChildren():
+                    if child.ControlTypeName != "ListItemControl":
                         continue
-                    # Check item's own Name first
-                    if item.Name and name in item.Name:
-                        found = item
-                        logging.debug(f"Found match at index {i} (item.Name)")
+                    if child.Name == name:
+                        found = child
                         break
-                    # Then check inner button Name
-                    btn = item.ButtonControl()
-                    if btn.Exists():
-                        btn_name = btn.Name
-                        if btn_name and name in btn_name:
-                            found = item
-                            logging.debug(f"Found match at index {i} (btn.Name)")
-                            break
-                except:
-                    continue
-            if found:
-                break
-            logging.debug(f"第 {attempt + 1} 次扫描未找到「{name}」（共 {len(items)} 项）")
+        except:
+            pass
+        logging.info(f"  计时: 聊天列表搜索={time.time()-t0:.2f}s")
 
         if not found:
-            logging.warning(f"群聊「{name}」未在聊天列表中找到，尝试 Ctrl+F")
-            if self.config.get("debug_mode", False):
-                self._debug_list_chats()
+            logging.warning(f"群聊「{name}」未找到，尝试 Ctrl+F")
             return self._switch_by_search(name)
 
-        try:
-            self.window.SetActive()
-            time.sleep(0.2)
+        # ButtonControl found → use its parent ListItemControl
+        if found.ControlTypeName == "ButtonControl":
+            try:
+                p = found.GetParentControl()
+                if p and p.ControlTypeName == "ListItemControl":
+                    found = p
+            except:
+                pass
 
+        try:
             # Check if the item has a valid bounding rect (visible on screen)
             rect = found.BoundingRectangle
             try:
@@ -370,15 +363,15 @@ class RelayBot:
                 except:
                     pass
 
-            # Final visibility check
-            try:
-                rect = found.BoundingRectangle
-                if hasattr(rect, 'width'):
-                    visible = rect.width > 0 and rect.height > 0
-                else:
-                    visible = rect[2] > rect[0] and rect[3] > rect[1]
-            except:
-                visible = True  # If we can't check, proceed anyway
+                # Final visibility check
+                try:
+                    rect = found.BoundingRectangle
+                    if hasattr(rect, 'width'):
+                        visible = rect.width > 0 and rect.height > 0
+                    else:
+                        visible = rect[2] > rect[0] and rect[3] > rect[1]
+                except:
+                    visible = True
 
             if not visible:
                 logging.warning("群聊项不可见，尝试 Ctrl+F 搜索切换")
@@ -399,11 +392,9 @@ class RelayBot:
     def _switch_by_search(self, name: str) -> bool:
         """Fallback: use Ctrl+F, paste from clipboard, then Enter"""
         try:
-            # Ensure window is focused
-            self.window.SetActive()
+            # Ensure window is focused (Win32, fast)
+            self._bring_window_to_front()
             time.sleep(0.3)
-            self.window.SetFocus()
-            time.sleep(0.2)
             auto.SendKeys('{Ctrl}f')
             time.sleep(0.8)
             self._set_clipboard(name)
